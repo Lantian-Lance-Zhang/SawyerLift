@@ -1,7 +1,10 @@
 import argparse
 import datetime
 import gym
+from gym.spaces import Box
 import numpy as np
+import robosuite as suite
+from robosuite import load_controller_config
 import itertools
 import torch
 from sac import SAC
@@ -9,8 +12,6 @@ from torch.utils.tensorboard import SummaryWriter
 from replay_memory import ReplayMemory
 
 parser = argparse.ArgumentParser(description='PyTorch Soft Actor-Critic Args')
-parser.add_argument('--env-name', default="HalfCheetah-v2",
-                    help='Mujoco Gym environment (default: HalfCheetah-v2)')
 parser.add_argument('--policy', default="Gaussian",
                     help='Policy Type: Gaussian | Deterministic (default: Gaussian)')
 parser.add_argument('--eval', type=bool, default=True,
@@ -46,29 +47,79 @@ parser.add_argument('--cuda', action="store_true",
                     help='run on CUDA (default: False)')
 
 # Added argument to origin
-parser.add_argument('--episodes_per_checkpoint', type=int, default=0,
-                    help='how frequently to save SAC model (default: 0 - does not save)')
+parser.add_argument('--episodes_per_checkpoint', type=int, default=10,
+                    help='how frequently to save SAC model (default: saves every 10 episodes)')
+parser.add_argument('--env-name', default='SawyerLift',
+                    help='Gym/robosuite environment (default: SawyerLift)')
+parser.add_argument('--gym', action='store_true',
+                    help='use gym environments instead of robosuite environments (default: False)')
+parser.add_argument('--suffix', default='',
+                    help='suffix for filename when saving model')
+
 
 args = parser.parse_args()
 
+
+def concat_attributes(state, attributes_included):
+    # Retrieve included attributes from env state and concatenate them
+    return np.hstack([state[attr] for attr in attributes_included])
+
+
 # Environment
 # env = NormalizedActions(gym.make(args.env_name))
-env = gym.make(args.env_name)
-env.seed(args.seed)
-env.action_space.seed(args.seed)
+# env = gym.make(args.env_name)
+# env.seed(args.seed)
+# env.action_space.seed(args.seed)
+
+controller_configs = load_controller_config(default_controller='OSC_POSITION')
+attributes_included = ['robot0_gripper_qpos', 'gripper_to_cube_pos']
+
+if not args.gym:
+    if args.env_name == 'SawyerLift':
+        env = suite.make(
+            env_name='Lift',
+            robots='Sawyer',
+            controller_configs=controller_configs,
+            control_freq=20,
+            has_renderer=False,
+            has_offscreen_renderer=False,
+            use_camera_obs=False,
+            reward_shaping=True,
+            reward_scale=5,
+            horizon=250
+        )
+        
+        env.reset()
+        state = concat_attributes(env._obs_cache, attributes_included)
+        state_dim = len(state)
+        
+        low, high = env.action_spec
+        action_space = Box(low=low, high=high, dtype=np.float32)
+        
+        env._max_episode_steps = env.horizon
+    else:
+        raise NotImplementedError
+else:
+    env = gym.make(args.env_name)
+    env.seed(args.seed)
+    
+    env.action_space.seed(args.seed)
+    state_dim = env.observation_space.shape[0]
+    action_space = env.action_space
+    
 
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 
 # Agent
-agent = SAC(env.observation_space.shape[0], env.action_space, args)
+agent = SAC(state_dim, action_space, args)  # action space... (gotta creat an object I think)
 # Save initial model (for testing purposes)
 if args.episodes_per_checkpoint:
-    agent.save_checkpoint(args.env_name, suffix='init')
+    agent.save_checkpoint(args.env_name, suffix='init_' + str(args.alpha) + '_' + args.suffix)
 
 #Tesnorboard
-writer = SummaryWriter('runs/{}_SAC_{}_{}_{}'.format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"), args.env_name,
-                                                             args.policy, "autotune" if args.automatic_entropy_tuning else ""))
+writer = SummaryWriter('runs/{}_SAC_{}_{}_{}_{}'.format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"), args.env_name,
+                                                             args.policy, "autotune" if args.automatic_entropy_tuning else str(args.alpha), args.suffix))
 
 # Memory
 memory = ReplayMemory(args.replay_size, args.seed)
@@ -82,10 +133,12 @@ for i_episode in itertools.count(1):
     episode_steps = 0
     done = False
     state = env.reset()
+    if not args.gym:
+            state = concat_attributes(state, attributes_included)
 
     while not done:
         if args.start_steps > total_numsteps:
-            action = env.action_space.sample()  # Sample random action
+            action = action_space.sample()
         else:
             action = agent.select_action(state)  # Sample action from policy
 
@@ -102,7 +155,7 @@ for i_episode in itertools.count(1):
                 writer.add_scalar('entropy_temprature/alpha', alpha, updates)
                 updates += 1
 
-        next_state, reward, done, _ = env.step(action) # Step
+        next_state, reward, done, _ = env.step(action) # Step  
         episode_steps += 1
         total_numsteps += 1
         episode_reward += reward
@@ -110,7 +163,9 @@ for i_episode in itertools.count(1):
         # Ignore the "done" signal if it comes from hitting the time horizon.
         # (https://github.com/openai/spinningup/blob/master/spinup/algos/sac/sac.py)
         mask = 1 if episode_steps == env._max_episode_steps else float(not done)
-
+        
+        if not args.gym:
+            next_state = concat_attributes(next_state, attributes_included)
         memory.push(state, action, reward, next_state, mask) # Append transition to memory
 
         state = next_state
@@ -119,10 +174,10 @@ for i_episode in itertools.count(1):
         break
 
     writer.add_scalar('reward/train', episode_reward, i_episode)
-    print("Episode: {}, total numsteps: {}, episode steps: {}, reward: {}".format(i_episode, total_numsteps, episode_steps, round(episode_reward, 2)))
+    print("Episode: {}, total numsteps: {}, episode steps: {}, reward: {}, done: {}".format(i_episode, total_numsteps, episode_steps, round(episode_reward, 2), env._check_success() if not args.gym else 'N/A'))
 
     if args.episodes_per_checkpoint and i_episode % args.episodes_per_checkpoint == 0:
-        agent.save_checkpoint(args.env_name, suffix=str(i_episode))
+        agent.save_checkpoint(args.env_name, suffix=str(i_episode) + '_' + str(args.alpha) + '_' + args.suffix)
     
     if i_episode % 10 == 0 and args.eval is True:
         avg_reward = 0.
@@ -131,15 +186,21 @@ for i_episode in itertools.count(1):
             state = env.reset()
             episode_reward = 0
             done = False
+            
+            episode_steps = 0
+            
             while not done:
+                if not args.gym:
+                    state = concat_attributes(state, attributes_included)
                 action = agent.select_action(state, evaluate=True)
 
                 next_state, reward, done, _ = env.step(action)
                 episode_reward += reward
-
-
+                episode_steps += 1
+                
                 state = next_state
             avg_reward += episode_reward
+            print(episode_steps, episode_reward)
         avg_reward /= episodes
 
 
